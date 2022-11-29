@@ -1,0 +1,30 @@
+{
+  "name": "super-cold-storage-nodejs",
+  "version": "0.0.1",
+  "description": "Super Cold Storage NodeJS server",
+  "license": "MIT",
+  "author": "ACC01ADE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ACC01ADE/super-cold-storage-nodejs.git"
+  },
+  "homepage": "https://github.com/ACC01ADE/super-cold-storage-nodejs",
+  "keywords": [],
+  "bugs": {
+    "url": "https://github.com/ACC01ADE/super-cold-storage-nodejs/issues"
+  },
+  "main": "index.js",
+  "files": [],
+  "scripts": {
+    "prettier:check": "prettier --loglevel error --ignore-path .gitignore --list-different .",
+    "prettier:fix": "prettier --loglevel error --ignore-path .gitignore --write ."
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.1.3",
+    "@noble/secp256k1": "^1.7.0",
+    "utf8": "^3.0.0"
+  },
+  "devDependencies": {
+    "prettier": "^2.6.2"
+  }
+}
