@@ -1,1 +1,1 @@
-## Super Cold Storage Signer
+## Super Cold Storage NodeJS server
