@@ -9,8 +9,8 @@ import board
 from PIL import Image, ImageDraw, ImageFont
 from adafruit_rgb_display import st7789
 
-authorizationFont = ImageFont.truetype("/srv/www/nodejs/ttf/sourcecode.ttf", 26)
-fingerprintFont = ImageFont.truetype("/srv/www/nodejs/ttf/sourcecode.ttf", 26)
+authorizationFont = ImageFont.truetype("/srv/www/nodejs/tft/sourcecode.ttf", 26)
+fingerprintFont = ImageFont.truetype("/srv/www/nodejs/tft/sourcecode.ttf", 26)
 white = "#FFFFFF"
 black = "#000000"
 
@@ -61,7 +61,7 @@ def splash():
   draw = ImageDraw.Draw(image)
   draw.rectangle((0, 0, width, height), outline=0, fill=black)
   disp.image(image, rotation)
-  image = Image.open("/srv/www/nodejs/ttf/splash.jpg")
+  image = Image.open("/srv/www/nodejs/tft/splash.jpg")
   disp.image(image, rotation)
 
 def authorization(authText):
