@@ -1,6 +1,19 @@
 'use strict';
 
+require('dotenv').config();
+
 const utf8encoder = require('utf8');
+
+const verbose = process.argv[process.argv.length - 1] == 'verbose';
+
+const __console = console;
+console = {
+  log: function () {
+    if (verbose) {
+      __console.log.bind(null, ...arguments).apply();
+    }
+  },
+};
 
 Object.defineProperty(String.prototype, 'removeX', {
   value: function () {
@@ -76,15 +89,40 @@ const utf_8 = 'utf-8'; // use this encoding for headers
 const charset = '; charset=' + utf_8; // append this to content-type header
 
 const root_dir = '/srv/www/nodejs';
-const ssl_dir = '/srv/www/nodejs/ssl';
+const ssl_dir = root_dir + '/ssl';
+const yubi_dir = root_dir + '/yubihsm';
+const tft_dir = root_dir + '/tft';
 
 const fs = require('fs');
 const tls = require('tls');
 const http = require('http');
 const https = require('https');
 const execSync = require('child_process').execSync;
+const subProcess = require('child_process').spawn;
+const Stream = require('stream');
 const secp = require('@noble/secp256k1');
 const { keccak_256 } = require('@noble/hashes/sha3');
+
+// use this to create YubiKey asymmetric logic approach instead of encrypted password
+// https://github.com/Yubico/yubihsm-shell/blob/master/examples/asym_auth.c
+const yubiShell = process.env.YUBI_COMMAND;
+const yubiConnector = process.env.YUBI_CONNECTOR;
+const yubiLogin = process.env.YUBI_AUTH;
+
+execSync(['/usr/bin/dd', 'if=/dev/hwrng', 'of=' + yubi_dir + '/auth.txt', 'bs=20', 'count=1'].join(' '), {
+  cwd: root_dir,
+  shell: '/bin/sh',
+  stdio: 'pipe',
+});
+const auth = fs
+  .readFileSync(yubi_dir + '/auth.txt')
+  .toString('hex')
+  .removeX()
+  .padStart(40, '0');
+fs.writeFileSync(yubi_dir + '/auth.txt', auth, { encoding: utf, flag: 'w' });
+
+const IP = process.env.IP;
+const DOMAIN = process.env.DOMAIN;
 
 execSync(
   [
@@ -98,10 +136,59 @@ execSync(
     '-nodes',
     '-out ' + ssl_dir + '/internal.crt',
     '-keyout ' + ssl_dir + '/internal.key',
-    '-subj "/C=FR/ST=Ile-de-France/L=Paris/O=ACC01ADE/OU=Super Cold Storage/CN=supercoldstorage.local"',
+    '-subj "/C=FR/ST=Ile-de-France/L=Paris/O=ACC01ADE/OU=Super Cold Storage/CN=' + DOMAIN + '"',
+    '-addext "subjectAltName=DNS:' + DOMAIN + ',IP:' + IP + '"',
   ].join(' '),
   { cwd: root_dir, shell: '/bin/sh', stdio: 'pipe' }
 );
+
+const sslFingerprint = Buffer.from(
+  execSync(
+    ['openssl', 'x509', '-noout', '-fingerprint', '-sha1', '-inform pem', '-in ' + ssl_dir + '/internal.crt'].join(' '),
+    { cwd: root_dir, shell: '/bin/sh', stdio: 'pipe' }
+  )
+)
+  .toString(utf)
+  .replace('SHA1 Fingerprint=', '')
+  .replace(/([0-9A-Z:]{15})/gi, '$&\n')
+  .replace(/:$/g, '')
+  .replace(/:/g, ' ');
+fs.writeFileSync(ssl_dir + '/fingerprint.txt', sslFingerprint, { encoding: utf, flag: 'w' });
+
+if (fs.existsSync(tft_dir + '/tft.pid')) {
+  try {
+    execSync(['/usr/bin/kill', fs.readFileSync(tft_dir + '/tft.pid', utf)].join(' '), {
+      cwd: root_dir,
+      shell: '/bin/sh',
+      stdio: 'pipe',
+    });
+  } catch (ex) {
+    // ignore errors
+  }
+}
+const tft = subProcess('/usr/bin/python3', [
+  tft_dir + '/main.py',
+  sslFingerprint,
+  auth
+    .removeX()
+    .replace(/([0-9a-f]{2})/gi, '$& ')
+    .replace(/([0-9a-f\s]{14})\s/gi, '$&\n')
+    .toUpperCase(),
+]);
+fs.writeFileSync(tft_dir + '/tft.pid', tft.pid.toString(), { encoding: utf, flag: 'w' });
+
+function exitHandler(options, exitCode) {
+  tft.kill();
+  if (fs.existsSync(tft_dir + '/tft.pid')) {
+    fs.unlinkSync(tft_dir + '/tft.pid');
+  }
+  process.exit();
+}
+process.on('exit', exitHandler.bind(null, { exit: true }));
+process.on('SIGINT', exitHandler.bind(null, { exit: true }));
+process.on('SIGUSR1', exitHandler.bind(null, { exit: true }));
+process.on('SIGUSR2', exitHandler.bind(null, { exit: true }));
+process.on('uncaughtException', exitHandler.bind(null, { exit: true }));
 
 const toChecksumAddress = function (input) {
   input = input.removeX().toLowerCase();
@@ -118,13 +205,13 @@ const toChecksumAddress = function (input) {
 };
 
 const getObjectAddress = function (id) {
-  const pubkeyFile = root_dir + '/yubihsm/pubkey';
+  const pubkeyFile = yubi_dir + '/pubkey';
   fs.writeFileSync(pubkeyFile, '', { encoding: utf, flag: 'w' });
   execSync(
     [
-      'yubihsm-shell',
-      '--connector yhusb://',
-      '-p password',
+      yubiShell,
+      yubiConnector,
+      yubiLogin,
       '-a get-public-key',
       '-i ' + id,
       '--outformat bin',
@@ -141,18 +228,10 @@ const getObjectAddress = function (id) {
 };
 
 const getYubiHSMKeys = function () {
-  const objectsFile = root_dir + '/yubihsm/objects';
+  const objectsFile = yubi_dir + '/objects';
   fs.writeFileSync(objectsFile, '', { encoding: utf, flag: 'w' });
   execSync(
-    [
-      'yubihsm-shell',
-      '--connector yhusb://',
-      '-p password',
-      '-a list-objects',
-      '-A any',
-      '-t any',
-      '--out ' + objectsFile,
-    ].join(' '),
+    [yubiShell, yubiConnector, yubiLogin, '-a list-objects', '-A any', '-t any', '--out ' + objectsFile].join(' '),
     { cwd: root_dir, shell: '/bin/sh', stdio: 'pipe' }
   );
   const foundObjects = [
@@ -175,15 +254,14 @@ const getYubiHSMKeys = function () {
 };
 const keys = getYubiHSMKeys();
 
-const msgFile = root_dir + '/yubihsm/msg';
-const sigFile = root_dir + '/yubihsm/sig';
+const msgFile = yubi_dir + '/msg';
+const sigFile = yubi_dir + '/sig';
 
 const signCommand = function (id) {
   return [
-    'yubihsm-shell',
-    '--connector',
-    'yhusb://',
-    '-p password',
+    yubiShell,
+    yubiConnector,
+    yubiLogin,
     '-a sign-ecdsa',
     '-i ' + id,
     '-A ecdsa-keccak256',
@@ -227,7 +305,7 @@ const getHeaders = function (additionalHeaders) {
     'Content-Type': 'application/json' + charset,
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET,PUT,POST,DELETE,OPTIONS',
-    'Access-Control-Allow-Headers': 'content-type, cookie, set-cookie, session-cookie, set-session-cookie, *',
+    'Access-Control-Allow-Headers': 'content-type, *',
     'Access-Control-Expose-Headers': '*',
     'Access-Control-Allow-Credentials': 'true',
   };
@@ -334,88 +412,115 @@ const sign = function (wallet, message) {
   return signature;
 };
 
-const ServerLogic = function (request, response) {
-  console.log(request.url);
-  let validWallet = false;
-  let wallet = null;
-  if (/^\/(0x|)[\da-f]{40}\//i.test(request.url)) {
-    wallet = request.url.split('/')[1].removeX().toLowerCase();
-    if (wallet in keys) {
-      validWallet = true;
+const CheckAuth = function (request, response, callback) {
+  const fail = function (msg) {
+    response.writeHead(401, 'Unauthorized', AllowAccess(request.headers));
+    response.end(
+      JSON.stringify({
+        error: msg,
+      }),
+      utf
+    );
+  };
+  if ('authorization' in request.headers || 'Authorization' in request.headers) {
+    let authHeader =
+      'authorization' in request.headers ? request.headers['authorization'] : request.headers['Authorization'];
+    authHeader = authHeader.removeX().toLowerCase();
+    if (auth == authHeader) {
+      callback();
+    } else {
+      fail('Authorization header value incorrect');
     }
+  } else {
+    fail('Authorization header value incorrect');
   }
-  if (request.method == 'OPTIONS') {
-    response.writeHead(200, 'OK', AllowAccess(request.headers));
-    response.end('{}', utf);
-  } else if (request.method == 'POST') {
-    processPost(request, response, function () {
-      // we have a valid wallet address provided
-      if (validWallet) {
-        if (request.url.split('/')[2] == 'signTransaction') {
-          const payload = JSON.parse(request.post.toString(utf));
-          console.log('payload', '/signTransaction', payload);
-          response.writeHead(200, 'OK', AllowAccess(request.headers));
-          response.end(JSON.stringify({ signature: sign(wallet, payload.message) }), utf);
-        } else if (request.url.split('/')[2] == 'signMessage') {
-          const payload = JSON.parse(request.post.toString(utf));
-          console.log('payload', '/signMessage', payload);
-          let message = payload.message.removeX();
-          if (message.length != 64) {
-            if (!(message.length % 2 === 0 && /^[\da-f]+$/i.test(message))) {
-              message = message.toHex();
+};
+
+const ServerLogic = function (request, response) {
+  CheckAuth(request, response, function () {
+    console.log(request.url);
+    let validWallet = false;
+    let wallet = null;
+    if (/^\/(0x|)[\da-f]{40}\//i.test(request.url)) {
+      wallet = request.url.split('/')[1].removeX().toLowerCase();
+      if (wallet in keys) {
+        validWallet = true;
+      }
+    }
+    if (request.method == 'OPTIONS') {
+      response.writeHead(200, 'OK', AllowAccess(request.headers));
+      response.end('{}', utf);
+    } else if (request.method == 'POST') {
+      processPost(request, response, function () {
+        // we have a valid wallet address provided
+        if (validWallet) {
+          if (request.url.split('/')[2] == 'signTransaction') {
+            const payload = JSON.parse(request.post.toString(utf));
+            console.log('payload', '/signTransaction', payload);
+            response.writeHead(200, 'OK', AllowAccess(request.headers));
+            response.end(JSON.stringify({ signature: sign(wallet, payload.message) }), utf);
+          } else if (request.url.split('/')[2] == 'signMessage') {
+            const payload = JSON.parse(request.post.toString(utf));
+            console.log('payload', '/signMessage', payload);
+            let message = payload.message.removeX();
+            if (message.length != 64) {
+              if (!(message.length % 2 === 0 && /^[\da-f]+$/i.test(message))) {
+                message = message.toHex();
+              }
+              message = Buffer.from(keccak_256(message.toBuffer())).toString('hex').removeX();
             }
-            message = Buffer.from(keccak_256(message.toBuffer())).toString('hex').removeX();
+            message = ethMsgPre + message;
+            response.writeHead(200, 'OK', AllowAccess(request.headers));
+            response.end(JSON.stringify({ signature: sign(wallet, message) }), utf);
+          } else {
+            NotFound(request, response);
           }
-          message = ethMsgPre + message;
-          response.writeHead(200, 'OK', AllowAccess(request.headers));
-          response.end(JSON.stringify({ signature: sign(wallet, message) }), utf);
         } else {
-          NotFound(request, response);
+          response.writeHead(400, 'Bad Request', AllowAccess(request.headers));
+          response.end(
+            JSON.stringify({
+              error: wallet ? 'Account not currently loaded or supported by device' : 'Invalid account provided in URL',
+            }),
+            utf
+          );
+        }
+      });
+    } else if (request.method == 'GET') {
+      if (request.url == '/accounts') {
+        console.log('payload', '/accounts');
+        console.log('accounts', { accounts: Object.keys(keys) });
+        response.writeHead(200, 'OK', AllowAccess(request.headers));
+        response.end(
+          JSON.stringify({
+            accounts: Object.keys(keys).map((e) => {
+              return toChecksumAddress(e);
+            }),
+          }),
+          utf
+        );
+      } else if (request.url.split('/')[2] == 'getLabel') {
+        if (validWallet) {
+          console.log('payload', '/getLabel');
+          console.log('label', { label: toChecksumAddress(wallet) });
+          response.writeHead(200, 'OK', AllowAccess(request.headers));
+          response.end(JSON.stringify({ label: toChecksumAddress(wallet) }), utf);
+        } else {
+          response.writeHead(400, 'Bad Request', AllowAccess(request.headers));
+          response.end(
+            JSON.stringify({
+              error: wallet ? 'Account not currently loaded or supported by device' : 'Invalid account provided in URL',
+            }),
+            utf
+          );
         }
       } else {
-        response.writeHead(400, 'Bad Request', AllowAccess(request.headers));
-        response.end(
-          JSON.stringify({
-            error: wallet ? 'Account not currently loaded or supported by device' : 'Invalid account provided in URL',
-          }),
-          utf
-        );
-      }
-    });
-  } else if (request.method == 'GET') {
-    if (request.url == '/accounts') {
-      console.log('payload', '/accounts');
-      console.log('accounts', { accounts: Object.keys(keys) });
-      response.writeHead(200, 'OK', AllowAccess(request.headers));
-      response.end(
-        JSON.stringify({
-          accounts: Object.keys(keys).map((e) => {
-            return toChecksumAddress(e);
-          }),
-        }),
-        utf
-      );
-    } else if (request.url.split('/')[2] == 'getLabel') {
-      if (validWallet) {
-        console.log('payload', '/getLabel');
-        console.log('label', { label: toChecksumAddress(wallet) });
         response.writeHead(200, 'OK', AllowAccess(request.headers));
-        response.end(JSON.stringify({ label: toChecksumAddress(wallet) }), utf);
-      } else {
-        response.writeHead(400, 'Bad Request', AllowAccess(request.headers));
-        response.end(
-          JSON.stringify({
-            error: wallet ? 'Account not currently loaded or supported by device' : 'Invalid account provided in URL',
-          }),
-          utf
-        );
+        response.end('{}', utf);
       }
     } else {
       NotFound(request, response);
     }
-  } else {
-    NotFound(request, response);
-  }
+  });
 };
 
 const httpServer = http.createServer(HttpServerLogic);
